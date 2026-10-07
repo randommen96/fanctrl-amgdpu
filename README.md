@@ -18,10 +18,18 @@ from sysfs:
   (e.g. junction >= 70 °C -> 100 %).
 * Ramp limiting: fast ramp-up (`ramp_up_step`, default 64/cycle) for safety,
   slow ramp-down (`ramp_down_step`, default 8/cycle) to avoid hunting.
+* **Anti-hunting hysteresis** (`spin_up_margin`, default 48): while a fan
+  sits at its baseline duty (where it may stall), small temp bumps do NOT
+  restart it - it only spins up when the target exceeds `min_pwm +
+  spin_up_margin`. This kills the stall -> slight warmup -> restart -> cool
+  down -> stall limit cycle.
 * First cycle after boot/restart: an upward target is applied immediately
   (never start under-cooling a hot GPU); downward changes ramp down slowly.
-* Fail-safe: if no temperature can be read, all fans go to
-  `on_sensor_error_pwm` (default: full speed) and an error is logged.
+* Fail-safe: if no temperature can be read - **including the GPU being
+  unplugged or the amdgpu driver not loaded** - all fans go to
+  `on_sensor_error_pwm` (default: full speed). The service does NOT crash:
+  it logs one error, keeps polling for the GPU and resumes normal control
+  automatically when it appears again (e.g. after `modprobe amdgpu`).
 * Optional rpm monitoring (`fan_rpm_min`): warns in the journal when a fan
   appears stuck/dead (3 consecutive low readings) — the warning includes the
   current GPU temps.
@@ -66,6 +74,18 @@ junction_points = 45:32, 60:192, 70:255
 The old single-fan/single-GPU format (paths in `[main]`, `[edge]`/`[junction]`/
 `[mem]` sections) keeps working.
 
+## Discovering fans (`--detect` / `--probe`)
+
+```bash
+sudo python3 /usr/local/bin/fanctrl.py --detect
+# read-only inventory of every hwmon pwm/fan channel + suggested [fanN] config
+
+sudo python3 /usr/local/bin/fanctrl.py --probe it8728:pwm2
+# active test: spins the given pwm up/down briefly and reports which fan's
+# rpm reacts (original values are restored). 'all' probes every pwm with an
+# enable file. Fans spin up for a few seconds - don't probe CPU fans blindly.
+```
+
 ## Files
 
 | file | purpose |
@@ -81,6 +101,7 @@ sudo systemctl status fanctrl          # service state
 journalctl -u fanctrl -f               # live log (pwm changes, status lines, warnings)
 sudo python3 /usr/local/bin/fanctrl.py --once      # single control cycle
 sudo python3 /usr/local/bin/fanctrl.py --dry-run   # show decisions, no writes
+sudo python3 /usr/local/bin/fanctrl.py --detect    # find pwm/fan channels
 sensors | grep -A3 it8728              # pwm2 % + fan2 rpm
 ```
 
@@ -88,6 +109,7 @@ sensors | grep -A3 it8728              # pwm2 % + fan2 rpm
 
 * `interval` — polling period; higher = calmer but slower reaction.
 * `ramp_up_step` / `ramp_down_step` — max pwm change per cycle.
+* `spin_up_margin` — anti-hunting hysteresis above the baseline (see above).
 * `[fanN] min_pwm` — baseline duty (~12 %); keeps the fan spinning for airflow.
 * `[gpuN] *_points = 45:32, 60:192, 70:255` (°C:pwm pairs, linear between
   points, clamped at both ends).

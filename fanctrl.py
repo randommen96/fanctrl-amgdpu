@@ -11,13 +11,22 @@ sensor on any GPU exceeding its limits bumps every fan's speed.
 
 Features:
   * multiple GPUs ([gpu0], [gpu1], ...) and multiple fans ([fan1], [fan2], ...)
-  * ramp limiting (fast ramp-up, slow ramp-down - no exaggerated jumps)
-  * fail-safe PWM when no temperature can be read
-  * optional fan-RPM monitoring to detect a dead/stuck fan (warning includes temps)
+  * synced fan groups (same 'group' -> one shared pwm, e.g. a fan duct)
+  * anti-hunting hysteresis around the idle point (spin_up_margin): while the
+    fan sits at its baseline duty it is NOT restarted by small temp bumps -
+    it only spins up when there is real cooling demand
+  * fast ramp-up / slow ramp-down per cycle; immediate apply on first cycle
+  * GPU absent (unplugged or driver not loaded) -> fail-safe mode: fans are
+    driven to on_sensor_error_pwm and the service keeps polling for the GPU,
+    resuming normal control when it appears again (no crash-loop)
+  * per-fan rpm monitoring (dead-fan warning includes current temps)
   * periodic status line so the journal always shows what is happening
+  * --detect / --probe: discover which pwm channels control which fans
 
 Usage:
   fanctrl.py [--config /etc/fanctrl.conf] [--once] [--dry-run]
+  fanctrl.py --detect
+  fanctrl.py --probe it8728:pwm2[,hwmon3:pwm1,...]   (or --probe all)
 
 Stdlib only. Designed to run under systemd (logs to stderr -> journal).
 """
@@ -94,77 +103,56 @@ class Config:
         self.interval = float(m.get("interval", "5"))
         self.ramp_up_step = int(m.get("ramp_up_step", "64"))
         self.ramp_down_step = int(m.get("ramp_down_step", "8"))
+        # anti-hunting: while a fan sits at its baseline (min_pwm), it is only
+        # spun up when the target exceeds min_pwm + spin_up_margin. Small temp
+        # bumps that would otherwise restart a stalled fan are ignored.
+        self.spin_up_margin = int(m.get("spin_up_margin", "48"))
         self.on_sensor_error_pwm = int(m.get("on_sensor_error_pwm", "255"))
         self.fan_rpm_min = int(m.get("fan_rpm_min", "0"))      # 0 = disabled
         self.status_every = int(m.get("status_every", "6"))    # 0 = disabled
         self.log_level = m.get("log_level", "info").upper()
 
-        # ---- fans: [fan1], [fan2], ... (legacy: paths in [main]) ----------
+        # ---- fans: [fan1], [fan2], ... -------------------------------------
         self.fans = []
         fan_sections = {s for s in cp.sections() if re.fullmatch(r"fan\d+", s)}
-        if fan_sections:
-            for name in sorted(fan_sections, key=lambda s: int(s[3:])):
-                s = cp[name]
-                pwm_path = s.get("pwm_path", "")
-                if not pwm_path:
-                    sys.exit(f"fanctrl: [{name}] needs pwm_path")
-                self.fans.append(FanConfig(
-                    name=name,
-                    pwm_path=pwm_path,
-                    enable_path=s.get("enable_path", ""),
-                    rpm_path=s.get("rpm_path", ""),
-                    min_pwm=int(s.get("min_pwm", "32")),
-                    max_pwm=int(s.get("max_pwm", "255")),
-                    group=s.get("group", "").strip(),
-                ))
-        elif m.get("pwm_path", ""):
-            self.fans.append(FanConfig(
-                name="fan1",
-                pwm_path=m["pwm_path"],
-                enable_path=m.get("enable_path", ""),
-                rpm_path=m.get("rpm_path", ""),
-                min_pwm=int(m.get("min_pwm", "32")),
-                max_pwm=int(m.get("max_pwm", "255")),
-            ))
-        if not self.fans:
+        if not fan_sections:
             sys.exit("fanctrl: no fan configured (add a [fan1] section with pwm_path)")
+        for name in sorted(fan_sections, key=lambda s: int(s[3:])):
+            s = cp[name]
+            pwm_path = s.get("pwm_path", "")
+            if not pwm_path:
+                sys.exit(f"fanctrl: [{name}] needs pwm_path")
+            self.fans.append(FanConfig(
+                name=name,
+                pwm_path=pwm_path,
+                enable_path=s.get("enable_path", ""),
+                rpm_path=s.get("rpm_path", ""),
+                min_pwm=int(s.get("min_pwm", "32")),
+                max_pwm=int(s.get("max_pwm", "255")),
+                group=s.get("group", "").strip(),
+            ))
 
         for f in self.fans:
             if not (0 <= f.min_pwm <= f.max_pwm <= 255):
                 sys.exit(f"fanctrl: [{f.name}] bad pwm range {f.min_pwm}..{f.max_pwm}")
 
-        # ---- GPUs: [gpu0], [gpu1], ... (legacy: [edge]/[junction]/[mem]) --
+        # ---- GPUs: [gpu0], [gpu1], ... --------------------------------------
         self.gpus = []
         gpu_sections = {s for s in cp.sections() if re.fullmatch(r"gpu\d*", s)}
-        if gpu_sections:
-            for name in sorted(gpu_sections, key=lambda s: int(s[3:] or 0)):
-                s = cp[name]
-                if s.get("enabled", "true").strip().lower() in ("0", "false", "no"):
-                    continue
-                curves = {}
-                for sensor in SENSORS:
-                    spec = s.get(f"{sensor}_points", "")
-                    if spec:
-                        curves[sensor] = parse_points(spec, f"[{name}] {sensor}")
-                if not curves:
-                    sys.exit(f"fanctrl: [{name}] has no *_points configured")
-                self.gpus.append(GpuConfig(name, s.get("hwmon", "") or None, curves))
-        else:
-            # legacy single-GPU format: [edge]/[junction]/[mem] with 'points'
+        if not gpu_sections:
+            sys.exit("fanctrl: no GPU configured (add a [gpu0] section with *_points)")
+        for name in sorted(gpu_sections, key=lambda s: int(s[3:] or 0)):
+            s = cp[name]
+            if s.get("enabled", "true").strip().lower() in ("0", "false", "no"):
+                continue
             curves = {}
             for sensor in SENSORS:
-                if not cp.has_section(sensor):
-                    continue
-                s = cp[sensor]
-                if s.get("enabled", "true").strip().lower() in ("0", "false", "no"):
-                    continue
-                spec = s.get("points", "")
+                spec = s.get(f"{sensor}_points", "")
                 if spec:
-                    curves[sensor] = parse_points(spec, f"[{sensor}]")
+                    curves[sensor] = parse_points(spec, f"[{name}] {sensor}")
             if not curves:
-                sys.exit("fanctrl: no temperature sensors configured "
-                         "(add [gpu0] with *_points, or legacy [edge]/[junction]/[mem])")
-            self.gpus.append(GpuConfig("gpu0", None, curves))
+                sys.exit(f"fanctrl: [{name}] has no *_points configured")
+            self.gpus.append(GpuConfig(name, s.get("hwmon", "") or None, curves))
 
         if not self.gpus:
             sys.exit("fanctrl: no enabled GPU configured")
@@ -216,7 +204,6 @@ def build_temp_map(hwmon_dir):
             label = ""
         if label:
             label_files[label.lower()] = f
-    # conventional fallback order for amdgpu without labels
     fallback = {"edge": "temp1_input", "junction": "temp2_input", "mem": "temp3_input"}
     m = {}
     for name in SENSORS:
@@ -269,13 +256,13 @@ class FanGroup:
     def __init__(self, name, members):
         self.name = name
         self.members = members  # list[FanConfig]
-        # start at the HIGHEST member pwm (never drop anyone below where they are)
-        pws = []
+        pws = []                # start at the HIGHEST member pwm (never drop anyone)
         for m in members:
             p = read_sysfs_int(m.pwm_path, m.min_pwm)
             pws.append(max(0, min(255, p if p is not None else m.min_pwm)))
         self.current_pwm = max(pws) if pws else 0
         self.actual = {m.name: p for m, p in zip(members, pws)}
+        self.base = max(m.min_pwm for m in members)  # baseline duty (fan may stall here)
         self.first_cycle = True
         self.rpm_state = {m.name: {"streak": 0, "warned": False} for m in members}
 
@@ -307,39 +294,12 @@ class FanController:
         self.cfg = cfg
         self.dry_run = dry_run
 
-        # resolve GPU hwmon dirs (explicit or auto-assigned in order)
-        auto_pool = list(find_amdgpu_hwmons())
-        for gpu in cfg.gpus:
-            if gpu.hwmon_dir:
-                if not os.path.isdir(gpu.hwmon_dir):
-                    sys.exit(f"fanctrl: [{gpu.name}] hwmon dir not found: {gpu.hwmon_dir}")
-            else:
-                if not auto_pool:
-                    sys.exit(f"fanctrl: [{gpu.name}] no amdgpu hwmon device available")
-                gpu.hwmon_dir = auto_pool.pop(0)
-
         self.gpus = []
-        for gpu in cfg.gpus:
-            temp_map = build_temp_map(gpu.hwmon_dir)
-            sensors = {n: p for n, p in temp_map.items() if n in gpu.curves}
-            missing = [n for n in gpu.curves if n not in temp_map]
-            if missing:
-                log.warning("[%s] no sysfs sensor(s) for: %s (skipped)",
-                            gpu.name, ", ".join(missing))
-            if not sensors:
-                log.error("[%s] none of the configured sensors are readable - "
-                          "GPU disabled", gpu.name)
-                continue
-            self.gpus.append((gpu, sensors))
-            for name, path in sorted(sensors.items()):
-                log.info("[%s] %-9s -> %s (hwmon: %s)", gpu.name, name, path, gpu.hwmon_dir)
-
-        if not self.gpus:
-            sys.exit("fanctrl: no readable GPU sensor at all")
+        self.gpu_loss_logged = False
+        self._setup_gpus(log_new=True)
 
         # build fan groups: same non-empty group name -> driven together
-        by_group = {}
-        order = []
+        by_group, order = {}, []
         for f in cfg.fans:
             key = f.group if f.group else f.name
             if key not in by_group:
@@ -349,12 +309,41 @@ class FanController:
         self.groups = [FanGroup(k, by_group[k]) for k in order]
         for g in self.groups:
             who = "+".join(m.name for m in g.members)
-            log.info("[%s] current pwm at startup: %d (members: %s)", g.name, g.current_pwm, who)
+            log.info("[%s] current pwm at startup: %d (baseline %d, members: %s)",
+                     g.name, g.current_pwm, g.base, who)
 
         self.consec_errors = 0
         self.status_counter = 0
         self.last_temps_str = ""
         self._stop = False
+
+    # ---- GPU setup / rescan --------------------------------------------------
+
+    def _setup_gpus(self, log_new=False):
+        """(Re)build self.gpus from config + currently present amdgpu hwmons."""
+        new_gpus = []
+        auto_pool = list(find_amdgpu_hwmons())
+        for gpu in self.cfg.gpus:
+            if gpu.hwmon_dir:
+                if not os.path.isdir(gpu.hwmon_dir):
+                    continue  # this GPU is absent right now
+            else:
+                if not auto_pool:
+                    continue
+                gpu.hwmon_dir = auto_pool.pop(0)
+            temp_map = build_temp_map(gpu.hwmon_dir)
+            sensors = {n: p for n, p in temp_map.items() if n in gpu.curves}
+            missing = [n for n in gpu.curves if n not in temp_map]
+            if missing and log_new:
+                log.warning("[%s] no sysfs sensor(s) for: %s (skipped)",
+                            gpu.name, ", ".join(missing))
+            if sensors:
+                new_gpus.append((gpu, sensors))
+                if log_new:
+                    for name, path in sorted(sensors.items()):
+                        log.info("[%s] %-9s -> %s (hwmon: %s)",
+                                 gpu.name, name, path, gpu.hwmon_dir)
+        self.gpus = new_gpus
 
     # ---- reading -----------------------------------------------------------
 
@@ -394,6 +383,28 @@ class FanController:
     # ---- one control cycle ---------------------------------------------------
 
     def cycle(self):
+        # no GPU present at all (unplugged / driver not loaded)? keep polling
+        if not self.gpus:
+            self._setup_gpus(log_new=True)
+            if not self.gpus:
+                self.consec_errors += 1
+                fail_pwm = self.cfg.on_sensor_error_pwm
+                if not self.gpu_loss_logged:
+                    log.error("no amdgpu GPU/hwmon present - driving all fans to "
+                              "fail-safe pwm %d and polling for the GPU to return",
+                              fail_pwm)
+                    self.gpu_loss_logged = True
+                else:
+                    log.debug("still no amdgpu GPU (consec=%d)", self.consec_errors)
+                for g in self.groups:
+                    g.set_pwm(fail_pwm, self.dry_run)
+                    g.current_pwm = fail_pwm
+                return
+
+        if self.gpu_loss_logged:
+            log.info("amdgpu GPU detected again - resuming normal control")
+            self.gpu_loss_logged = False
+
         temps = self.read_temps()
         tstr = self.fmt_temps(temps) or "no temps readable"
         self.last_temps_str = tstr
@@ -411,12 +422,19 @@ class FanController:
         self.consec_errors = 0
         target, dom = self.target_for_fan(temps)
 
-        # ramp limiting: fast up (safety), slow down (no hunting).
-        # First cycle after boot/restart applies an upward target immediately -
-        # never start under-cooling a hot GPU.
+        # ramp limiting + anti-hunting hysteresis:
+        #  - fast up (safety), slow down (no hunting)
+        #  - while a fan sits at its baseline duty it is NOT restarted by small
+        #    temp bumps; it only spins up when target >= base + spin_up_margin
+        #  - first cycle after boot/restart applies an upward target immediately
+        #    (never start under-cooling a hot GPU)
         for g in self.groups:
-            if g.first_cycle and target >= g.current_pwm:
-                new = target
+            if g.current_pwm <= g.base:
+                if target >= g.base + self.cfg.spin_up_margin:
+                    new = target if g.first_cycle else \
+                        min(target, g.current_pwm + self.cfg.ramp_up_step)
+                else:
+                    new = g.base  # hold low - no chasing / stall-restart flapping
             elif target > g.current_pwm:
                 new = min(target, g.current_pwm + self.cfg.ramp_up_step)
             elif target < g.current_pwm:
@@ -476,11 +494,11 @@ class FanController:
         signal.signal(signal.SIGTERM, self._handle_stop)
         signal.signal(signal.SIGINT, self._handle_stop)
         log.info("fanctrl starting: fans=%s gpus=%s interval=%.1fs "
-                 "ramp_up=%d ramp_down=%d dry_run=%s",
+                 "ramp_up=%d ramp_down=%d spin_up_margin=%d dry_run=%s",
                  ",".join(g.name for g in self.groups),
-                 ",".join(g.name for g, _ in self.gpus),
+                 ",".join(g.name for g, _ in self.gpus) or "<none present>",
                  self.cfg.interval, self.cfg.ramp_up_step, self.cfg.ramp_down_step,
-                 self.dry_run)
+                 self.cfg.spin_up_margin, self.dry_run)
         while not self._stop:
             started = time.monotonic()
             try:
@@ -489,7 +507,6 @@ class FanController:
                 log.exception("cycle failed: %s", e)
             if once:
                 break
-            # sleep in small slices so SIGTERM is handled promptly
             deadline = started + self.cfg.interval
             while not self._stop and time.monotonic() < deadline:
                 time.sleep(0.2)
@@ -501,11 +518,160 @@ class FanController:
         self._stop = True
 
 
+# --------------------------------------------------------------------------
+# fan discovery: --detect (read-only) and --probe (active)
+# --------------------------------------------------------------------------
+
+def scan_hwmon_channels():
+    """Inventory of all hwmon pwm/fan channels. Returns list of dicts."""
+    chans = []
+    for dev in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            name = open(os.path.join(dev, "name")).read().strip()
+        except OSError:
+            continue
+        entry = {"hwmon": os.path.basename(dev), "name": name, "pwms": [], "fans": []}
+        for f in sorted(glob.glob(os.path.join(dev, "pwm[0-9]*"))):
+            b = os.path.basename(f)
+            if not re.fullmatch(r"pwm\d+", b):
+                continue
+            n = int(b[3:])
+            entry["pwms"].append({
+                "num": n, "path": f,
+                "enable": os.path.join(dev, f"pwm{n}_enable"),
+                "value": read_sysfs_int(f),
+                "min": read_sysfs_int(os.path.join(dev, f"pwm{n}_min")),
+                "max": read_sysfs_int(os.path.join(dev, f"pwm{n}_max"))})
+        for f in sorted(glob.glob(os.path.join(dev, "fan[0-9]*_input"))):
+            b = os.path.basename(f)[: -len("_input")]
+            n = int(b[3:])
+            entry["fans"].append({"num": n, "path": f,
+                                  "rpm": read_sysfs_int(f),
+                                  "min": read_sysfs_int(os.path.join(dev, f"fan{n}_min"))})
+        if entry["pwms"] or entry["fans"]:
+            chans.append(entry)
+    return chans
+
+
+def cmd_detect():
+    """Read-only: list pwm/fan channels and suggest a config."""
+    print("hwmon pwm/fan inventory (read-only):")
+    suggested = []
+    for e in scan_hwmon_channels():
+        print(f"\n{e['hwmon']} ({e['name']})")
+        for p in e["pwms"]:
+            mode = ""
+            if os.path.exists(p["enable"]):
+                ev = read_sysfs_int(p["enable"])
+                mode = " [manual]" if ev else " [auto]"
+            print(f"  pwm{p['num']}: value={p['value']} min={p['min']} max={p['max']}{mode}")
+        for f in e["fans"]:
+            guess = "  <- likely pwm%d" % f["num"] if any(p["num"] == f["num"] for p in e["pwms"]) else ""
+            print(f"  fan{f['num']}: {f['rpm']} rpm (min={f['min']}){guess}")
+        for p in e["pwms"]:
+            if any(f["num"] == p["num"] for f in e["fans"]) and os.path.exists(p["enable"]):
+                suggested.append((e, p))
+    if suggested:
+        print("\nsuggested config (verify with --probe before using!):")
+        for i, (e, p) in enumerate(suggested, 1):
+            dev = os.path.dirname(p["path"])
+            print(f"""
+[fan{i}]
+pwm_path    = {p['path']}
+enable_path = {p['enable']}
+rpm_path    = {os.path.join(dev, f"fan{p['num']}_input")}
+min_pwm     = 32
+max_pwm     = 255
+group       =""")
+    else:
+        print("\nno pwm channels with a matching fan input found")
+
+
+def cmd_probe(specs, hold):
+    """Active test: nudge each given pwm and see which fan reacts.
+
+    specs: 'chip:pwmN' (chip = driver name like it8728 or dir like hwmon2)
+           or ['all'] for every pwm that has an enable file.
+    Original pwm/enable values are restored after each probe.
+    """
+    want_all = "all" in specs
+    targets = []
+    for e in scan_hwmon_channels():
+        for p in e["pwms"]:
+            if not os.path.exists(p["enable"]):
+                continue
+            keys = {f"{e['name']}:pwm{p['num']}", f"{e['hwmon']}:pwm{p['num']}"}
+            if want_all or keys & set(specs):
+                targets.append((e, p))
+    if not targets:
+        sys.exit(f"fanctrl: no probeable pwm matching {specs} (see --detect)")
+
+    print(f"probing {len(targets)} channel(s), hold {hold:g}s each - fans spin up "
+          "briefly. Ctrl-C to abort.")
+    time.sleep(2)
+
+    results = []
+    for e, p in targets:
+        n = p["num"]
+        pwm_path, en_path = p["path"], p["enable"]
+        orig_pwm = read_sysfs_int(pwm_path, 0) or 0
+        orig_en = read_sysfs_int(en_path, 0) or 0
+        fans = {f["num"]: f["path"] for f in e["fans"]}
+        try:
+            write_sysfs(en_path, 1)
+            write_sysfs(pwm_path, 255)
+            time.sleep(hold)
+            high = {k: read_sysfs_int(v) or 0 for k, v in fans.items()}
+            low_val = p["min"] if p["min"] is not None else 0
+            try:
+                write_sysfs(pwm_path, low_val)
+            except OSError:
+                low_val = 255  # driver refused; delta will be ~0
+            time.sleep(hold)
+            low = {k: read_sysfs_int(v) or 0 for k, v in fans.items()}
+        finally:
+            try:
+                write_sysfs(pwm_path, orig_pwm)
+                write_sysfs(en_path, orig_en)
+            except OSError as err:
+                print(f"WARNING: could not restore {e['hwmon']}/pwm{n}: {err}")
+        deltas = {k: high[k] - low[k] for k in fans}
+        best = max(deltas, key=lambda k: deltas[k]) if deltas else None
+        if best is not None and deltas[best] >= 100:
+            print(f"{e['hwmon']} ({e['name']}) pwm{n}: controls fan{best} "
+                  f"({low[best]} -> {high[best]} rpm)")
+            results.append((e, p, best))
+        else:
+            detail = ", ".join(f"fan{k}: {deltas[k]}" for k in sorted(deltas)) or "no fans"
+            print(f"{e['hwmon']} ({e['name']}) pwm{n}: no clear fan reaction ({detail})")
+
+    if results:
+        print("\nsuggested config (verify!):")
+        for i, (e, p, fan_n) in enumerate(results, 1):
+            dev = os.path.dirname(p["path"])
+            print(f"""
+[fan{i}]
+pwm_path    = {p['path']}
+enable_path = {p['enable']}
+rpm_path    = {os.path.join(dev, f"fan{fan_n}_input")}
+min_pwm     = 32
+max_pwm     = 255
+group       =""")
+
+
+# --------------------------------------------------------------------------
+
 def main():
     ap = argparse.ArgumentParser(description="GPU-temperature driven chassis fan controller")
     ap.add_argument("--config", default="/etc/fanctrl.conf")
     ap.add_argument("--once", action="store_true", help="run a single control cycle and exit")
     ap.add_argument("--dry-run", action="store_true", help="log decisions but do not write pwm")
+    ap.add_argument("--detect", action="store_true",
+                    help="list all pwm/fan channels + suggested config (read-only)")
+    ap.add_argument("--probe", metavar="CHIP:PWMN[,..]|all",
+                    help="actively test which fan(s) the given pwm channel(s) control")
+    ap.add_argument("--probe-hold", type=float, default=3.0,
+                    help="seconds to hold each probe state (default 3)")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -514,6 +680,14 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    if args.detect:
+        cmd_detect()
+        return
+    if args.probe:
+        specs = [s.strip() for s in args.probe.split(",") if s.strip()]
+        cmd_probe(specs, args.probe_hold)
+        return
 
     cfg = Config(args.config)
     logging.getLogger().setLevel(getattr(logging, cfg.log_level, logging.INFO))
