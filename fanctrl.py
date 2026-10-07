@@ -82,7 +82,8 @@ class GpuConfig:
 class Config:
     def __init__(self, path):
         import configparser
-        cp = configparser.ConfigParser(interpolation=None)
+        cp = configparser.ConfigParser(interpolation=None,
+                                       inline_comment_prefixes=("#", ";"))
         try:
             with open(path) as f:
                 cp.read_file(f)
