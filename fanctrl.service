@@ -1,0 +1,15 @@
+[Unit]
+Description=fanctrl - chassis fan control driven by amdgpu temperatures
+Documentation=file:/usr/local/share/fanctrl/README.md
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/fanctrl.py --config /etc/fanctrl.conf
+Restart=always
+RestartSec=5
+# The hardware pwm keeps its last value if this service is stopped/crashes,
+# which is a safe state for a cooling fan (it was running before).
+
+[Install]
+WantedBy=multi-user.target
