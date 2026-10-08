@@ -33,6 +33,7 @@ Stdlib only. Designed to run under systemd (logs to stderr -> journal).
 
 import argparse
 import glob
+import json
 import logging
 import os
 import re
@@ -115,6 +116,9 @@ class Config:
         self.sync_warn_pct = int(m.get("sync_warn_pct", "15"))       # 0 = off
         self.sync_warn_min_diff = int(m.get("sync_warn_min_diff", "150"))
         self.status_every = int(m.get("status_every", "6"))    # 0 = disabled
+        # per-fan rpm = a*pwm + b fit from --calibrate ({} if absent)
+        self.calibration_file = m.get("calibration_file",
+                                      "/var/lib/fanctrl/calibration.json")
         self.log_level = m.get("log_level", "info").upper()
 
         # ---- fans: [fan1], [fan2], ... -------------------------------------
@@ -161,6 +165,20 @@ class Config:
 
         if not self.gpus:
             sys.exit("fanctrl: no enabled GPU configured")
+
+
+def fit_linear(xs, ys):
+    """Least-squares line y = a*x + b. Returns (a, b) or None if under-determined."""
+    n = len(xs)
+    if n < 2:
+        return None
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx == 0:
+        return None
+    a = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    return a, my - a * mx
 
 
 def curve_value(points, temp_c):
@@ -298,6 +316,18 @@ class FanGroup:
             self.actual[m.name] = v
 
 
+def build_groups(cfg):
+    """[(group_name, [FanConfig, ...]), ...] - same non-empty group => driven together."""
+    by_group, order = {}, []
+    for f in cfg.fans:
+        key = f.group if f.group else f.name
+        if key not in by_group:
+            by_group[key] = []
+            order.append(key)
+        by_group[key].append(f)
+    return [(k, by_group[k]) for k in order]
+
+
 class FanController:
     def __init__(self, cfg, dry_run=False):
         self.cfg = cfg
@@ -307,19 +337,24 @@ class FanController:
         self.gpu_loss_logged = False
         self._setup_gpus(log_new=True)
 
-        # build fan groups: same non-empty group name -> driven together
-        by_group, order = {}, []
-        for f in cfg.fans:
-            key = f.group if f.group else f.name
-            if key not in by_group:
-                by_group[key] = []
-                order.append(key)
-            by_group[key].append(f)
-        self.groups = [FanGroup(k, by_group[k]) for k in order]
+        self.groups = [FanGroup(k, ms) for k, ms in build_groups(cfg)]
         for g in self.groups:
             who = "+".join(m.name for m in g.members)
             log.info("[%s] current pwm at startup: %d (baseline %d, members: %s)",
                      g.name, g.current_pwm, g.base, who)
+
+        # pwm->rpm calibration from --calibrate ({} when absent/corrupt)
+        self.calib = {}
+        try:
+            with open(cfg.calibration_file) as f:
+                self.calib = json.load(f)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            log.warning("cannot read calibration %s: %s", cfg.calibration_file, e)
+        if self.calib:
+            log.info("calibration loaded from %s (%d fan(s))",
+                     cfg.calibration_file, len(self.calib))
 
         self.consec_errors = 0
         self.status_counter = 0
@@ -522,19 +557,33 @@ class FanController:
         return s
 
     def check_fan_rpm(self, g, m):
-        """Per-fan rpm monitoring (even inside a synced group)."""
+        """Per-fan rpm monitoring (even inside a synced group).
+
+        Threshold is fan_rpm_min, or - if a --calibrate fit exists for this
+        fan - 50% of the expected rpm at the current pwm, whichever is
+        higher: that also catches a motor stuck at half speed while it is
+        still far above the absolute minimum.
+        """
         if not m.rpm_path or self.cfg.fan_rpm_min <= 0:
             return
         st = g.rpm_state[m.name]
         rpm = self._rpm(m)
         if rpm is None:
             return
-        if g.current_pwm >= m.min_pwm and rpm < self.cfg.fan_rpm_min:
+        threshold = self.cfg.fan_rpm_min
+        expected = None
+        c = self.calib.get(m.name)
+        if c and g.current_pwm >= m.min_pwm:
+            expected = max(0.0, c["a"] * g.current_pwm + c["b"])
+            threshold = max(threshold, int(expected * 0.5))
+        if g.current_pwm >= m.min_pwm and rpm < threshold:
             st["streak"] += 1
             if st["streak"] == 3 and not st["warned"]:
-                log.warning("[%s] fan rpm %d below threshold %d while pwm=%d - "
+                exp_str = (f" (expected ~{expected:.0f} at pwm {g.current_pwm})"
+                           if expected is not None else "")
+                log.warning("[%s] fan rpm %d below threshold %d while pwm=%d%s - "
                             "fan may be stuck or dead | %s",
-                            m.name, rpm, self.cfg.fan_rpm_min, g.current_pwm,
+                            m.name, rpm, threshold, g.current_pwm, exp_str,
                             self.last_temps_str)
                 st["warned"] = True
         else:
@@ -714,6 +763,86 @@ max_pwm     = 255
 group       =""")
 
 
+def cmd_calibrate(cfg, hold, n_points):
+    """Active test: sweep pwm through several steps, read rpm, fit a line.
+
+    Per fan we get rpm ~= a*pwm + b (least squares over the whole operating
+    range). The controller uses it for smarter dead-fan thresholds. Fans
+    spin up/down - stop the running service first so it doesn't fight the
+    sweep; original pwm/enable values are restored afterwards.
+    """
+    print(f"calibrating pwm->rpm: {n_points} steps, {hold:g}s hold each. "
+          "Fans will spin up and down - stop fanctrl.service first!")
+    time.sleep(2)
+
+    try:
+        with open(cfg.calibration_file) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        saved = {}
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    for gname, members in build_groups(cfg):
+        rpm_members = [m for m in members if m.rpm_path]
+        if not rpm_members:
+            continue
+        uniq_pwms, uniq_enables = [], []
+        for m in members:
+            if m.pwm_path not in uniq_pwms:
+                uniq_pwms.append(m.pwm_path)
+            if m.enable_path and m.enable_path not in uniq_enables:
+                uniq_enables.append(m.enable_path)
+        lo = min(m.min_pwm for m in members)
+        hi = max(m.max_pwm for m in members)
+        steps = sorted({int(round(lo + (hi - lo) * i / max(1, n_points - 1)))
+                        for i in range(n_points)})
+        orig_pwm = {p: read_sysfs_int(p, 0) or 0 for p in uniq_pwms}
+        orig_en = {p: read_sysfs_int(p, 0) or 0 for p in uniq_enables}
+
+        print(f"\n[{gname}] sweeping pwm {steps[0]}..{steps[-1]}")
+        print("  " + "pwm".rjust(5) + "" + "".join(f" {m.name:>8}" for m in rpm_members))
+        data = {m.name: ([], []) for m in rpm_members}   # name -> (xs, ys)
+        try:
+            for v in steps:
+                for p in uniq_pwms:
+                    write_sysfs(p, v)
+                for p in uniq_enables:
+                    write_sysfs(p, 1)
+                time.sleep(hold)
+                vals = []
+                for m in rpm_members:
+                    r = read_sysfs_int(m.rpm_path)
+                    if r is not None:
+                        data[m.name][0].append(v)
+                        data[m.name][1].append(r)
+                    vals.append(str(r) if r is not None else "-")
+                print("  " + str(v).rjust(5) + "".join(f" {v2:>8}" for v2 in vals))
+        finally:
+            for p, v in orig_pwm.items():
+                write_sysfs(p, v)
+            for p, v in orig_en.items():
+                write_sysfs(p, v)
+
+        for m in rpm_members:
+            xs, ys = data[m.name]
+            fit = fit_linear(xs, ys)
+            if fit:
+                a, b = fit
+                saved[m.name] = {"a": round(a, 4), "b": round(b, 2),
+                                 "points": len(xs), "fitted_at": now}
+                print(f"  {m.name}: rpm ~= {a:.2f}*pwm + {b:.0f}  ({len(xs)} points)")
+            else:
+                print(f"  {m.name}: not enough readings to fit")
+
+    try:
+        os.makedirs(os.path.dirname(cfg.calibration_file) or ".", exist_ok=True)
+        with open(cfg.calibration_file, "w") as f:
+            json.dump(saved, f, indent=1, sort_keys=True)
+        print(f"\nsaved calibration to {cfg.calibration_file}")
+    except OSError as e:
+        print(f"WARNING: could not save calibration: {e}")
+
+
 # --------------------------------------------------------------------------
 
 def main():
@@ -727,6 +856,13 @@ def main():
                     help="actively test which fan(s) the given pwm channel(s) control")
     ap.add_argument("--probe-hold", type=float, default=3.0,
                     help="seconds to hold each probe state (default 3)")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="sweep pwm and fit rpm=a*pwm+b per fan "
+                         "(stop the service first!)")
+    ap.add_argument("--cal-hold", type=float, default=4.0,
+                    help="seconds to hold each calibration step (default 4)")
+    ap.add_argument("--cal-points", type=int, default=6,
+                    help="number of pwm steps per sweep (default 6)")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -745,6 +881,10 @@ def main():
         return
 
     cfg = Config(args.config)
+
+    if args.calibrate:
+        cmd_calibrate(cfg, args.cal_hold, args.cal_points)
+        return
     logging.getLogger().setLevel(getattr(logging, cfg.log_level, logging.INFO))
     FanController(cfg, dry_run=args.dry_run).run(once=args.once)
 

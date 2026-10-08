@@ -2,7 +2,7 @@
 """Local tests for fanctrl.py: curve math, multi-GPU, synced fan groups,
 anti-hunting hysteresis, rpm warning w/ temps, status lines, fail-safe,
 GPU-absent (driver not loaded) mode + recovery."""
-import importlib.util, logging, os, shutil, tempfile
+import importlib.util, json, logging, os, shutil, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("fanctrl", os.path.join(HERE, "fanctrl.py"))
@@ -261,6 +261,46 @@ ctl2.cycle()
 rec = [r for r in records if "back in sync" in msg(r)]
 assert rec, records[:5]
 print("10. out-of-sync warning + recovery OK")
+
+# --- 11. fit_linear + calibration-aware dead-fan threshold ------------------
+assert fc.fit_linear([0, 100], [100, 300]) == (2.0, 100.0)
+assert fc.fit_linear([5, 5], [1, 2]) is None      # no x-spread
+assert fc.fit_linear([], []) is None
+# with a fit, threshold = max(fan_rpm_min, 50% of expected at current pwm)
+open(os.path.join(fanB, "rpm"), "w").write("1000\n")   # > 500, < 50% of ~2779
+ctl2.calib = {"fan1": {"a": 9.8, "b": 280.0}}
+g2.rpm_state["fan1"] = {"streak": 0, "warned": False}
+records.clear()
+for _ in range(3):
+    ctl2.cycle()
+cal_warns = [r for r in records if "below threshold" in msg(r) and "expected" in msg(r)]
+assert len(cal_warns) == 1, cal_warns
+assert "expected ~2779 at pwm 255" in cal_warns[0][1], cal_warns[0][1]
+# without the fit the same rpm is fine (1000 >= fan_rpm_min 500)
+ctl2.calib = {}
+g2.rpm_state["fan1"] = {"streak": 0, "warned": False}
+records.clear()
+for _ in range(3):
+    ctl2.cycle()
+assert not [r for r in records if "below threshold" in msg(r)], records[:5]
+print("11. fit_linear + calibration-aware threshold OK")
+
+# --- 12. cmd_calibrate: sweep, restore, save JSON ----------------------------
+cfgx = fc.Config(conf)
+cfgx.calibration_file = os.path.join(tmp, "cal.json")
+real_sleep = fc.time.sleep
+fc.time.sleep = lambda s: None
+try:
+    fc.cmd_calibrate(cfgx, hold=0.1, n_points=4)
+finally:
+    fc.time.sleep = real_sleep
+assert read_fan_pwm(tmp, "fanA") == 32, "original pwm not restored"   # test 2c left it at 32
+cal = json.load(open(os.path.join(tmp, "cal.json")))
+assert "fan1" in cal and set(cal["fan1"]) >= {"a", "b", "points", "fitted_at"}, cal
+# controller picks the file up
+ctl5 = fc.FanController(cfgx)
+assert ctl5.calib.get("fan1", {}).get("a") == cal["fan1"]["a"]
+print("12. cmd_calibrate sweep/restore/save + load OK")
 
 shutil.rmtree(tmp); shutil.rmtree(tmp2)
 print("\nALL LOCAL TESTS PASSED")
