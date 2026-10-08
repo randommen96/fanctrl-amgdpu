@@ -447,8 +447,9 @@ class FanController:
             g.first_cycle = False
 
             if new != g.current_pwm:
-                log.info("[%s] pwm %d -> %d (target %d, dominant: %s; %s)",
-                         g.name, g.current_pwm, new, target, dom, tstr)
+                # same section order as the status line: FAN | TEMPS | CONTROL
+                log.info("[%s] pwm %d -> %d | %s | target=%d dominant=%s",
+                         g.name, g.current_pwm, new, tstr, target, dom)
             # always re-apply (even when unchanged): heals external clobbering
             g.set_pwm(new, self.dry_run)
             g.current_pwm = new
@@ -460,15 +461,20 @@ class FanController:
         # periodic status line so the journal always shows activity
         self.status_counter += 1
         if self.cfg.status_every > 0 and self.status_counter % self.cfg.status_every == 0:
-            fans = " ".join(
-                f"{g.name}:pwm={g.current_pwm}" +
-                (" rpm=" + "/".join(str(self._rpm(m)) for m in g.members)
-                 if any(m.rpm_path for m in g.members) else "")
-                for g in self.groups)
-            log.info("status: %s | target=%d dominant=%s | %s", tstr, target, dom, fans)
+            fans = " ".join(self._fan_state(g) for g in self.groups)
+            # same section order as the change lines: FAN | TEMPS | CONTROL
+            log.info("status: %s | %s | target=%d dominant=%s", fans, tstr, target, dom)
 
     def _rpm(self, m):
         return read_sysfs_int(m.rpm_path)
+
+    def _fan_state(self, g):
+        """One group's fan state for the status line: 'name:pwm=N rpm=a/b'."""
+        s = f"{g.name}:pwm={g.current_pwm}"
+        if any(m.rpm_path for m in g.members):
+            rpms = [self._rpm(m) if m.rpm_path else None for m in g.members]
+            s += " rpm=" + "/".join(str(r) if r is not None else "?" for r in rpms)
+        return s
 
     def check_fan_rpm(self, g, m):
         """Per-fan rpm monitoring (even inside a synced group)."""

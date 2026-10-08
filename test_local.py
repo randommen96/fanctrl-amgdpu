@@ -213,5 +213,31 @@ infos = [r for r in records if "resuming normal control" in r[1]]
 assert infos, records[:5]
 print("8. GPU returned: normal control resumed")
 
+# --- 9. unified log format: FAN | TEMPS | CONTROL -------------------------
+import re
+# force a pwm change on ctl2's duct group (junction hot -> ramp up)
+def msg(r):  # strip the 'LEVEL ' prefix the cap handler adds
+    return r[1][len(r[0]) + 1:]
+
+records.clear()
+ctl2.cycle()  # may or may not change; ensure a change happens next
+g2.current_pwm = g2.current_pwm - 64 if g2.current_pwm > 32 else 32
+open(os.path.join(gpuC, "temp2_input"), "w").write("71000\n")
+ctl2.cycle()
+chg = [r for r in records if re.match(r"^\[duct\] pwm \d+ -> \d+ ", msg(r))]
+assert chg, records[:5]
+# FAN | TEMPS | CONTROL - same section order as the status line
+m = re.fullmatch(r"\[duct\] pwm \d+ -> \d+ \| (gpu\d\[[^\]]*\] )+gpu1\[junction=71\.0\] \| target=255 dominant=gpu1/junction", msg(chg[0]))
+assert m, msg(chg[0])
+# status line: same section order
+ctl2.status_counter = 2  # next cycle hits the status_every=3 boundary
+records.clear()
+ctl2.cycle()
+st = [r for r in records if msg(r).startswith("status: ")]
+assert st, records[:5]
+ms = re.fullmatch(r"status: duct:pwm=\d+ rpm=\d+/\d+ \| gpu0\[.*\] gpu1\[junction=71\.0\] \| target=255 dominant=gpu1/junction", msg(st[0]))
+assert ms, msg(st[0])
+print("9. unified log format (FAN | TEMPS | CONTROL) OK")
+
 shutil.rmtree(tmp); shutil.rmtree(tmp2)
 print("\nALL LOCAL TESTS PASSED")
