@@ -30,6 +30,10 @@ from sysfs:
   `on_sensor_error_pwm` (default: full speed). The service does NOT crash:
   it logs one error, keeps polling for the GPU and resumes normal control
   automatically when it appears again (e.g. after `modprobe amdgpu`).
+* **Self-healing pwm writes**: the intended duty is re-applied to every fan
+  on *every* cycle (not write-once), so external writers that clobber sysfs
+  (`sudo pwmconfig`, a stray `echo 0 > pwmN`, ...) are undone within one
+  `interval` instead of silently winning until the next restart.
 * Optional rpm monitoring (`fan_rpm_min`): warns in the journal when a fan
   appears stuck/dead (3 consecutive low readings) — the warning includes the
   current GPU temps.

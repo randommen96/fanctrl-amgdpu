@@ -267,12 +267,17 @@ class FanGroup:
         self.rpm_state = {m.name: {"streak": 0, "warned": False} for m in members}
 
     def set_pwm(self, value, dry_run):
-        """Write the same pwm to every member (clamped by each member's min/max)."""
-        changed = False
+        """Write the same pwm to every member (clamped by each member's min/max).
+
+        Re-applied on EVERY control cycle, not write-once: external writers
+        (pwmconfig, a manual `echo 0 > pwmN`, ...) can clobber sysfs at any
+        moment; without re-applying we would sit blind on their value until a
+        restart. The next cycle always restores our intended duty.
+        """
         for m in self.members:
             v = max(m.min_pwm, min(m.max_pwm, value))
-            if v == self.actual[m.name]:
-                continue
+            if dry_run and v == self.actual[m.name]:
+                continue  # don't spam dry-run logs in steady state
             if not dry_run:
                 try:
                     if m.enable_path:
@@ -285,8 +290,6 @@ class FanGroup:
                 log.info("[dry-run] %s would set pwm %d (currently %d)",
                          m.name, v, self.actual[m.name])
             self.actual[m.name] = v
-            changed = True
-        return changed
 
 
 class FanController:
@@ -446,7 +449,8 @@ class FanController:
             if new != g.current_pwm:
                 log.info("[%s] pwm %d -> %d (target %d, dominant: %s; %s)",
                          g.name, g.current_pwm, new, target, dom, tstr)
-                g.set_pwm(new, self.dry_run)
+            # always re-apply (even when unchanged): heals external clobbering
+            g.set_pwm(new, self.dry_run)
             g.current_pwm = new
 
         for g in self.groups:
