@@ -109,6 +109,11 @@ class Config:
         self.spin_up_margin = int(m.get("spin_up_margin", "48"))
         self.on_sensor_error_pwm = int(m.get("on_sensor_error_pwm", "255"))
         self.fan_rpm_min = int(m.get("fan_rpm_min", "0"))      # 0 = disabled
+        # synced groups: warn if member rpm's diverge by more than this %
+        # (and at least sync_warn_min_diff rpm), sustained for a few cycles.
+        # Normal bearing spread on one net is ~5-10% at low speed.
+        self.sync_warn_pct = int(m.get("sync_warn_pct", "15"))       # 0 = off
+        self.sync_warn_min_diff = int(m.get("sync_warn_min_diff", "150"))
         self.status_every = int(m.get("status_every", "6"))    # 0 = disabled
         self.log_level = m.get("log_level", "info").upper()
 
@@ -265,6 +270,7 @@ class FanGroup:
         self.base = max(m.min_pwm for m in members)  # baseline duty (fan may stall here)
         self.first_cycle = True
         self.rpm_state = {m.name: {"streak": 0, "warned": False} for m in members}
+        self.sync_state = {"streak": 0, "warned": False}  # group-level desync
 
     def set_pwm(self, value, dry_run):
         """Write the same pwm to every member (clamped by each member's min/max).
@@ -457,6 +463,7 @@ class FanController:
         for g in self.groups:
             for m in g.members:
                 self.check_fan_rpm(g, m)
+            self.check_group_sync(g)
 
         # periodic status line so the journal always shows activity
         self.status_counter += 1
@@ -467,6 +474,44 @@ class FanController:
 
     def _rpm(self, m):
         return read_sysfs_int(m.rpm_path)
+
+    def check_group_sync(self, g):
+        """Warn when the rpm's of a synced group diverge too far.
+
+        Fans on one pwm net should spin at (nearly) the same speed; a large,
+        sustained gap means one motor is lagging/stalling. Normal bearing
+        spread is a few % - hence both a relative and an absolute threshold,
+        and a streak so single noisy readings don't trigger it.
+        """
+        if self.cfg.sync_warn_pct <= 0 or len(g.members) < 2:
+            return
+        rpms = {}
+        for m in g.members:
+            if not m.rpm_path:
+                continue
+            r = self._rpm(m)
+            if r is not None:
+                rpms[m.name] = r
+        if len(rpms) < 2:
+            return
+        hi, lo = max(rpms.values()), min(rpms.values())
+        diff = hi - lo
+        thresh = max(self.cfg.sync_warn_min_diff,
+                     int(hi * self.cfg.sync_warn_pct / 100))
+        st = g.sync_state
+        if diff >= thresh:
+            st["streak"] += 1
+            if st["streak"] == 3 and not st["warned"]:
+                detail = " ".join(f"{n}={r}" for n, r in sorted(rpms.items()))
+                log.warning("[%s] fans out of sync: %d rpm apart (%s, threshold %d) | %s",
+                            g.name, diff, detail, thresh, self.last_temps_str)
+                st["warned"] = True
+        else:
+            if st["warned"]:
+                detail = " ".join(f"{n}={r}" for n, r in sorted(rpms.items()))
+                log.info("[%s] fans back in sync (%s)", g.name, detail)
+            st["streak"] = 0
+            st["warned"] = False
 
     def _fan_state(self, g):
         """One group's fan state for the status line: 'name:pwm=N rpm=a/b'."""

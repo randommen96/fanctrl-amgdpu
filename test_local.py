@@ -239,5 +239,28 @@ ms = re.fullmatch(r"status: duct:pwm=\d+ rpm=\d+/\d+ \| gpu0\[.*\] gpu1\[junctio
 assert ms, msg(st[0])
 print("9. unified log format (FAN | TEMPS | CONTROL) OK")
 
+# --- 10. synced group out-of-sync warning ------------------------------------
+g2.sync_state = {"streak": 0, "warned": False}   # test 4 already desynced them
+open(os.path.join(fanB, "rpm"), "w").write("2900\n")
+open(os.path.join(fanC, "rpm"), "w").write("1500\n")   # 1400 apart >= max(150, 15%)
+records.clear()
+for _ in range(3):
+    ctl2.cycle()
+sync_warns = [r for r in records if r[0] == "WARNING" and "out of sync" in msg(r)]
+assert len(sync_warns) == 1, sync_warns
+assert "fan1=2900 fan2=1500" in sync_warns[0][1], sync_warns[0][1]
+# no repeat while still out of sync
+for _ in range(3):
+    ctl2.cycle()
+assert sum(1 for r in records if "out of sync" in msg(r)) == 1, "warned twice"
+# normal spread again (~8%, below the 150 rpm floor) -> recovery note
+open(os.path.join(fanB, "rpm"), "w").write("2900\n")
+open(os.path.join(fanC, "rpm"), "w").write("2870\n")
+records.clear()
+ctl2.cycle()
+rec = [r for r in records if "back in sync" in msg(r)]
+assert rec, records[:5]
+print("10. out-of-sync warning + recovery OK")
+
 shutil.rmtree(tmp); shutil.rmtree(tmp2)
 print("\nALL LOCAL TESTS PASSED")
