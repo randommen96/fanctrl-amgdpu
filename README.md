@@ -36,10 +36,30 @@ from sysfs:
   `interval` instead of silently winning until the next restart.
 * Optional rpm monitoring (`fan_rpm_min`): warns in the journal when a fan
   appears stuck/dead (3 consecutive low readings) — the warning includes the
-  current GPU temps.
+  current GPU temps. If a `--calibrate` fit exists, the threshold becomes
+  `max(fan_rpm_min, 50% of expected rpm at the current pwm)`, so a motor
+  stuck at half speed is caught even far above the absolute minimum.
+* **Synced-group desync warning** (`sync_warn_pct`, `sync_warn_min_diff`):
+  fans on one pwm net should spin at (nearly) the same speed; a spread of
+  more than max(min_diff, pct% of the higher rpm) sustained for 3 cycles
+  raises a WARNING with both rpm's (and logs recovery). Normal bearing
+  spread is a few percent — the defaults (15% / 150 rpm) don't false-alarm.
+* **Stall control** (`allow_stall`, opt-in): the fan may stop completely
+  (pwm 0) when the GPU is cool. A temperature hysteresis band keeps it from
+  flapping on oscillating temps: it stalls only below `stall_temp` (and only
+  after `stall_confirm` cycles), and after a stall it restarts only above
+  `stall_temp + stall_start_margin` — the card may warm up a bit while
+  uncooled, that's fine. If it keeps chasing (≥ `stall_chase_limit`
+  stall/run flips within `stall_chase_window` seconds) it gives up on
+  stalling for the run and holds the fan at min rpm. Running fans never go
+  below their `min_pwm`; 0 is only the explicit stalled state.
 * A periodic **status line** (`status_every`, default every 6th cycle ≈ 30 s)
-  logs all temperatures, target pwm and measured rpm, so the journal always
-  shows what is happening even when nothing changes.
+  logs fan state, temperatures and target/dominant sensor, so the journal
+  always shows what is happening even when nothing changes. Change lines use
+  the same section order (FAN | TEMPS | CONTROL), e.g.
+
+      status: duct:pwm=72 rpm=1004/1092 | gpu0[edge=28.0 junction=29.0 mem=26.0] | target=32 dominant=gpu0/edge
+      [duct] pwm 72 -> 136 | gpu0[edge=55.0 junction=75.0 mem=57.0] | target=136 dominant=gpu0/junction
 
 ## Multiple GPUs and multiple fans
 
@@ -78,6 +98,23 @@ junction_points = 45:32, 60:192, 70:255
 The old single-fan/single-GPU format (paths in `[main]`, `[edge]`/`[junction]`/
 `[mem]` sections) keeps working.
 
+## Calibrating the pwm→rpm curve (`--calibrate`)
+
+```bash
+sudo systemctl stop fanctrl                      # it would fight the sweep
+sudo python3 /usr/local/bin/fanctrl.py --calibrate [--cal-points 6] [--cal-hold 4]
+sudo systemctl start fanctrl
+```
+
+Sweeps each fan group through several pwm steps (default 6, from the group's
+min to max), holds each for `--cal-hold` seconds (default 4) and reads every
+member's rpm. Per fan a least-squares line `rpm ~= a*pwm + b` is fitted and
+saved to `calibration_file` (default `/var/lib/fanctrl/calibration.json`,
+merged with existing entries); original pwm/enable values are restored.
+The controller loads the fit at startup and uses it for the dead-fan
+threshold (see above). Fans spin up/down during the sweep - don't run it on
+CPU fans blindly.
+
 ## Discovering fans (`--detect` / `--probe`)
 
 ```bash
@@ -114,9 +151,14 @@ sensors | grep -A3 it8728              # pwm2 % + fan2 rpm
 * `interval` — polling period; higher = calmer but slower reaction.
 * `ramp_up_step` / `ramp_down_step` — max pwm change per cycle.
 * `spin_up_margin` — anti-hunting hysteresis above the baseline (see above).
-* `[fanN] min_pwm` — baseline duty (~12 %); keeps the fan spinning for airflow.
+* `[fanN] min_pwm` — baseline duty; running fans never go below it. With
+  `allow_stall = true` the fan may also sit at pwm 0 when cool (see below).
 * `[gpuN] *_points = 45:32, 60:192, 70:255` (°C:pwm pairs, linear between
   points, clamped at both ends).
+* `allow_stall`, `stall_temp`, `stall_start_margin`, `stall_confirm`,
+  `stall_chase_limit`, `stall_chase_window` — stall control (see above).
+* `sync_warn_pct` / `sync_warn_min_diff` — desync warning for synced groups.
+* `fan_rpm_min` — dead-fan threshold (calibration-aware if a fit exists).
 * `status_every` — status line every N cycles (0 disables).
 
 After editing: `sudo systemctl restart fanctrl`.
