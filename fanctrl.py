@@ -110,6 +110,20 @@ class Config:
         self.spin_up_margin = int(m.get("spin_up_margin", "48"))
         self.on_sensor_error_pwm = int(m.get("on_sensor_error_pwm", "255"))
         self.fan_rpm_min = int(m.get("fan_rpm_min", "0"))      # 0 = disabled
+        # --- stall control (opt-in) ------------------------------------------
+        # Allow the fan to stop completely (pwm 0) when the GPU is cool, with
+        # hysteresis so temperature oscillation can't make it flap:
+        #  - stall only while the dominant temp is below stall_temp AND the
+        #    curves ask for no more than baseline (stall_confirm cycles)
+        #  - after a stall, restart only above stall_temp + stall_start_margin
+        #  - if it keeps chasing (>= stall_chase_limit transitions within
+        #    stall_chase_window seconds) it gives up and stays at min rpm
+        self.allow_stall = m.get("allow_stall", "false").strip().lower() in ("1", "true", "yes")
+        self.stall_temp = float(m.get("stall_temp", "45"))
+        self.stall_start_margin = float(m.get("stall_start_margin", "10"))
+        self.stall_confirm = int(m.get("stall_confirm", "3"))
+        self.stall_chase_limit = int(m.get("stall_chase_limit", "5"))
+        self.stall_chase_window = int(m.get("stall_chase_window", "600"))
         # synced groups: warn if member rpm's diverge by more than this %
         # (and at least sync_warn_min_diff rpm), sustained for a few cycles.
         # Normal bearing spread on one net is ~5-10% at low speed.
@@ -289,9 +303,17 @@ class FanGroup:
         self.first_cycle = True
         self.rpm_state = {m.name: {"streak": 0, "warned": False} for m in members}
         self.sync_state = {"streak": 0, "warned": False}  # group-level desync
+        # stall state (only used when allow_stall is on)
+        self.stalled = False
+        self.below_streak = 0
+        self.transitions = []      # monotonic timestamps of stall<->run changes
+        self.stall_disabled = False  # set once chasing is detected
 
-    def set_pwm(self, value, dry_run):
+    def set_pwm(self, value, dry_run, stall=False):
         """Write the same pwm to every member (clamped by each member's min/max).
+
+        With stall=True a literal 0 is written (fan off) - the min_pwm clamp
+        is what keeps a RUNNING fan above its baseline, not a stalled one.
 
         Re-applied on EVERY control cycle, not write-once: external writers
         (pwmconfig, a manual `echo 0 > pwmN`, ...) can clobber sysfs at any
@@ -299,7 +321,7 @@ class FanGroup:
         restart. The next cycle always restores our intended duty.
         """
         for m in self.members:
-            v = max(m.min_pwm, min(m.max_pwm, value))
+            v = 0 if stall else max(m.min_pwm, min(m.max_pwm, value))
             if dry_run and v == self.actual[m.name]:
                 continue  # don't spam dry-run logs in steady state
             if not dry_run:
@@ -414,15 +436,18 @@ class FanController:
         return " ".join(parts)
 
     def target_for_fan(self, temps):
-        """Max over all (gpu, sensor) curves. Returns (pwm, 'gpu/sensor' or None)."""
-        best, dom = 0, None
+        """Max over all (gpu, sensor) curves.
+
+        Returns (pwm, 'gpu/sensor' or None, dominant temp in °C or None).
+        """
+        best, dom, dom_t = 0, None, None
         for gpu_name in sorted(temps):
             gpu = next(g for g, _ in self.gpus if g.name == gpu_name)
             for sensor, t in temps[gpu_name].items():
                 p = curve_value(gpu.curves[sensor], t)
                 if p > best:
-                    best, dom = p, f"{gpu_name}/{sensor}"
-        return best, dom
+                    best, dom, dom_t = p, f"{gpu_name}/{sensor}", t
+        return best, dom, dom_t
 
     # ---- one control cycle ---------------------------------------------------
 
@@ -441,6 +466,8 @@ class FanController:
                 else:
                     log.debug("still no amdgpu GPU (consec=%d)", self.consec_errors)
                 for g in self.groups:
+                    g.stalled = False      # fail-safe overrides any stall
+                    g.below_streak = 0
                     g.set_pwm(fail_pwm, self.dry_run)
                     g.current_pwm = fail_pwm
                 return
@@ -459,12 +486,14 @@ class FanController:
             log.error("no temperature readable (%d consecutive), "
                       "setting all fans to fail-safe pwm %d", self.consec_errors, fail_pwm)
             for g in self.groups:
+                g.stalled = False
+                g.below_streak = 0
                 g.set_pwm(fail_pwm, self.dry_run)
                 g.current_pwm = fail_pwm
             return
 
         self.consec_errors = 0
-        target, dom = self.target_for_fan(temps)
+        target, dom, dom_temp = self.target_for_fan(temps)
 
         # ramp limiting + anti-hunting hysteresis:
         #  - fast up (safety), slow down (no hunting)
@@ -473,18 +502,12 @@ class FanController:
         #  - first cycle after boot/restart applies an upward target immediately
         #    (never start under-cooling a hot GPU)
         for g in self.groups:
-            if g.current_pwm <= g.base:
-                if target >= g.base + self.cfg.spin_up_margin:
-                    new = target if g.first_cycle else \
-                        min(target, g.current_pwm + self.cfg.ramp_up_step)
-                else:
-                    new = g.base  # hold low - no chasing / stall-restart flapping
-            elif target > g.current_pwm:
-                new = min(target, g.current_pwm + self.cfg.ramp_up_step)
-            elif target < g.current_pwm:
-                new = max(target, g.current_pwm - self.cfg.ramp_down_step)
+            if self.cfg.allow_stall and not g.stall_disabled and dom_temp is not None:
+                new = self._stall_step(g, target, dom_temp)
             else:
-                new = target
+                new = self._ramp_step(g, target)
+            if new > 0:      # any non-zero pwm means we are running again
+                g.stalled = False
             g.first_cycle = False
 
             if new != g.current_pwm:
@@ -492,7 +515,7 @@ class FanController:
                 log.info("[%s] pwm %d -> %d | %s | target=%d dominant=%s",
                          g.name, g.current_pwm, new, tstr, target, dom)
             # always re-apply (even when unchanged): heals external clobbering
-            g.set_pwm(new, self.dry_run)
+            g.set_pwm(new, self.dry_run, stall=g.stalled)
             g.current_pwm = new
 
         for g in self.groups:
@@ -506,6 +529,65 @@ class FanController:
             fans = " ".join(self._fan_state(g) for g in self.groups)
             # same section order as the change lines: FAN | TEMPS | CONTROL
             log.info("status: %s | %s | target=%d dominant=%s", fans, tstr, target, dom)
+
+    def _ramp_step(self, g, target):
+        """Ramp limiting + anti-hunting hysteresis (the non-stalling path).
+
+        Fast up (safety), slow down (no hunting); while a fan sits at its
+        baseline duty it is NOT restarted by small temp bumps - only a real
+        demand (target >= base + spin_up_margin) spins it up. First cycle
+        applies an upward target immediately (never start under-cooling).
+        """
+        if g.current_pwm <= g.base:
+            if target >= g.base + self.cfg.spin_up_margin:
+                return target if g.first_cycle else \
+                    min(target, g.current_pwm + self.cfg.ramp_up_step)
+            return g.base  # hold low - no chasing / stall-restart flapping
+        if target > g.current_pwm:
+            return min(target, g.current_pwm + self.cfg.ramp_up_step)
+        if target < g.current_pwm:
+            return max(target, g.current_pwm - self.cfg.ramp_down_step)
+        return target
+
+    def _stall_step(self, g, target, dom_temp):
+        """Stall-aware step: like _ramp_step but the fan may also sit at 0.
+
+        Stall band in temperature space (dominant sensor):
+          run  -> stall : dom_temp < stall_temp, curves ask for no more than
+                         baseline, confirmed for stall_confirm cycles
+          stall -> run  : dom_temp >= stall_temp + stall_start_margin
+        The band width is the hysteresis: a card that warms up a bit while
+        uncooled must not immediately re-stall the fan it just restarted.
+        """
+        if g.stalled:
+            if dom_temp >= self.cfg.stall_temp + self.cfg.stall_start_margin:
+                g.stalled = False
+                self._note_transition(g)
+                desired = max(g.base, target)
+                return desired if g.first_cycle else \
+                    min(desired, g.current_pwm + self.cfg.ramp_up_step)
+            return 0
+        if dom_temp < self.cfg.stall_temp and target <= g.base:
+            g.below_streak += 1
+            if g.below_streak >= self.cfg.stall_confirm:
+                g.stalled = True
+                self._note_transition(g)
+                return 0
+            return g.base
+        g.below_streak = 0
+        return self._ramp_step(g, target)
+
+    def _note_transition(self, g):
+        """Count stall<->run flips; give up on stalling if it keeps chasing."""
+        now = time.monotonic()
+        g.transitions.append(now)
+        cutoff = now - self.cfg.stall_chase_window
+        g.transitions = [t for t in g.transitions if t >= cutoff]
+        if len(g.transitions) >= self.cfg.stall_chase_limit:
+            g.stall_disabled = True
+            log.warning("[%s] stall/run keeps chasing (%d transitions within %ds) - "
+                        "giving up on stalling, fan stays at min rpm for this run",
+                        g.name, len(g.transitions), self.cfg.stall_chase_window)
 
     def _rpm(self, m):
         return read_sysfs_int(m.rpm_path)
@@ -551,7 +633,9 @@ class FanController:
     def _fan_state(self, g):
         """One group's fan state for the status line: 'name:pwm=N rpm=a/b'."""
         s = f"{g.name}:pwm={g.current_pwm}"
-        if any(m.rpm_path for m in g.members):
+        if g.stalled:
+            s += " stalled"
+        elif any(m.rpm_path for m in g.members):
             rpms = [self._rpm(m) if m.rpm_path else None for m in g.members]
             s += " rpm=" + "/".join(str(r) if r is not None else "?" for r in rpms)
         return s
@@ -597,12 +681,14 @@ class FanController:
     def run(self, once=False):
         signal.signal(signal.SIGTERM, self._handle_stop)
         signal.signal(signal.SIGINT, self._handle_stop)
+        stall = (f"{self.cfg.stall_temp:g}C+{self.cfg.stall_start_margin:g}C"
+                 if self.cfg.allow_stall else "off")
         log.info("fanctrl starting: fans=%s gpus=%s interval=%.1fs "
-                 "ramp_up=%d ramp_down=%d spin_up_margin=%d dry_run=%s",
+                 "ramp_up=%d ramp_down=%d spin_up_margin=%d stall=%s dry_run=%s",
                  ",".join(g.name for g in self.groups),
                  ",".join(g.name for g, _ in self.gpus) or "<none present>",
                  self.cfg.interval, self.cfg.ramp_up_step, self.cfg.ramp_down_step,
-                 self.cfg.spin_up_margin, self.dry_run)
+                 self.cfg.spin_up_margin, stall, self.dry_run)
         while not self._stop:
             started = time.monotonic()
             try:

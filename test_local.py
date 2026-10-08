@@ -302,5 +302,78 @@ ctl5 = fc.FanController(cfgx)
 assert ctl5.calib.get("fan1", {}).get("a") == cal["fan1"]["a"]
 print("12. cmd_calibrate sweep/restore/save + load OK")
 
-shutil.rmtree(tmp); shutil.rmtree(tmp2)
+# --- 13. stall with hysteresis + anti-chase -----------------------------------
+tmp3 = tempfile.mkdtemp()
+gpuS = make_gpu(tmp3, "hwmonS")
+fanS = make_fan(tmp3, "fanS", pwm="32")
+confS = f"""
+[main]
+interval = 1
+ramp_up_step = 64
+ramp_down_step = 8
+spin_up_margin = 48
+on_sensor_error_pwm = 255
+fan_rpm_min = 500
+status_every = 0
+allow_stall = true
+stall_temp = 45
+stall_start_margin = 2
+stall_confirm = 1
+stall_chase_limit = 5
+stall_chase_window = 600
+
+[fan1]
+pwm_path = {tmp3}/fanS/pwm
+enable_path = {tmp3}/fanS/en
+rpm_path = {tmp3}/fanS/rpm
+min_pwm = 32
+max_pwm = 255
+group =
+
+[gpu0]
+hwmon = {gpuS}
+edge_points = 45:32, 65:192, 80:255
+junction_points = 45:32, 60:192, 70:255
+mem_points = 45:32, 70:192, 90:255
+"""
+open(os.path.join(tmp3, "c.conf"), "w").write(confS)
+fc.find_amdgpu_hwmons = lambda: [gpuS]
+ctlS = fc.FanController(fc.Config(os.path.join(tmp3, "c.conf")))
+gS = ctlS.groups[0]
+
+# idle (27/28/25 C) -> confirmed below threshold -> stall to pwm 0
+ctlS.cycle()
+assert gS.stalled and read_fan_pwm(tmp3, "fanS") == 0, (gS.stalled, read_fan_pwm(tmp3, "fanS"))
+print("13a. idle card stalls the fan (pwm 0)")
+
+# junction 46 C: inside the hysteresis band (< 45+2) -> stays stalled
+open(os.path.join(gpuS, "temp2_input"), "w").write("46000\n")
+ctlS.cycle()
+assert gS.stalled and read_fan_pwm(tmp3, "fanS") == 0
+print("13b. warmup inside the band does NOT restart it (hysteresis)")
+
+# junction 48 C >= 45+2 -> startup threshold crossed -> spin up
+open(os.path.join(gpuS, "temp2_input"), "w").write("48000\n")
+ctlS.cycle()
+assert not gS.stalled and read_fan_pwm(tmp3, "fanS") == 64, \
+    (gS.stalled, read_fan_pwm(tmp3, "fanS"))   # min(max(base, target 64), 0+64)
+print("13c. restart above the startup threshold (pwm 64)")
+
+# now let it chase: cool/hot/cool/hot/cool -> 5 transitions total -> give up
+records.clear()
+for label, v in (("cool", "27000"), ("hot", "48000"), ("cool", "27000"),
+                 ("hot", "48000"), ("cool", "27000")):
+    open(os.path.join(gpuS, "temp2_input"), "w").write(v + "\n")
+    ctlS.cycle()
+assert gS.stall_disabled, gS.transitions
+chase = [r for r in records if "giving up on stalling" in msg(r)]
+assert chase, records[:6]
+# ...and from now on it never stalls again: min rpm even when cold
+for _ in range(3):
+    ctlS.cycle()
+assert not gS.stalled and read_fan_pwm(tmp3, "fanS") == 32, \
+    (gS.stalled, read_fan_pwm(tmp3, "fanS"))
+print("13d. chasing detected -> stalling disabled, fan held at min rpm")
+
+shutil.rmtree(tmp); shutil.rmtree(tmp2); shutil.rmtree(tmp3)
 print("\nALL LOCAL TESTS PASSED")
