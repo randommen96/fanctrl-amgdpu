@@ -384,5 +384,75 @@ assert not gS.stalled and read_fan_pwm(tmp3, "fanS") == 32, \
     (gS.stalled, read_fan_pwm(tmp3, "fanS"))
 print("13d. chasing detected -> stalling disabled, fan held at min rpm")
 
-shutil.rmtree(tmp); shutil.rmtree(tmp2); shutil.rmtree(tmp3)
+# --- 14. self_heal: write-on-change vs re-apply-every-cycle ------------------
+tmp4 = tempfile.mkdtemp()
+gpuH = make_gpu(tmp4, "hwmonH")
+fanH = make_fan(tmp4, "fanH", pwm="32")
+confH = f"""
+[main]
+interval = 1
+ramp_up_step = 64
+ramp_down_step = 8
+spin_up_margin = 48
+on_sensor_error_pwm = 255
+fan_rpm_min = 0
+status_every = 0
+self_heal = false
+
+[fan1]
+pwm_path = {tmp4}/fanH/pwm
+enable_path = {tmp4}/fanH/en
+rpm_path = {tmp4}/fanH/rpm
+min_pwm = 32
+max_pwm = 255
+group =
+
+[gpu0]
+hwmon = {gpuH}
+edge_points = 45:32, 65:192, 80:255
+junction_points = 45:32, 60:192, 70:255
+mem_points = 45:32, 70:192, 90:255
+"""
+open(os.path.join(tmp4, "c.conf"), "w").write(confH)
+fc.find_amdgpu_hwmons = lambda: [gpuH]
+ctlH = fc.FanController(fc.Config(os.path.join(tmp4, "c.conf")))
+pwm_file = os.path.join(tmp4, "fanH", "pwm")
+
+writes = []
+real_write = fc.write_sysfs
+fc.write_sysfs = lambda p, v: (writes.append((p, v)), real_write(p, v))
+try:
+    # steady state at baseline: no writes at all with self_heal=false
+    for _ in range(3):
+        ctlH.cycle()
+    assert [w for w in writes if w[0] == pwm_file] == [], writes
+    print("14a. self_heal=false: no pwm writes in steady state")
+
+    # real demand -> exactly one write
+    open(os.path.join(gpuH, "temp2_input"), "w").write("50000\n")  # target 85
+    ctlH.cycle()
+    assert read_fan_pwm(tmp4, "fanH") == 85
+    n_writes = len([w for w in writes if w[0] == pwm_file])
+    assert n_writes == 1, (n_writes, writes)
+    # ...and none while holding
+    for _ in range(2):
+        ctlH.cycle()
+    assert len([w for w in writes if w[0] == pwm_file]) == 1
+    print("14b. self_heal=false: single write on change, none while holding")
+
+    # external clobber is NOT healed while self_heal is off
+    open(pwm_file, "w").write("0\n")
+    ctlH.cycle()
+    assert read_fan_pwm(tmp4, "fanH") == 0, "clobber was healed but should not be"
+    print("14c. self_heal=false: external clobber sticks")
+
+    # flip the switch on -> next cycle heals it
+    ctlH.cfg.self_heal = True
+    ctlH.cycle()
+    assert read_fan_pwm(tmp4, "fanH") == 85
+    print("14d. self_heal=true: clobber healed on next cycle")
+finally:
+    fc.write_sysfs = real_write
+
+shutil.rmtree(tmp); shutil.rmtree(tmp2); shutil.rmtree(tmp3); shutil.rmtree(tmp4)
 print("\nALL LOCAL TESTS PASSED")

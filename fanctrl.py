@@ -16,6 +16,9 @@ Features:
     fan sits at its baseline duty it is NOT restarted by small temp bumps -
     it only spins up when there is real cooling demand
   * fast ramp-up / slow ramp-down per cycle; immediate apply on first cycle
+  * self-healing pwm writes (configurable, self_heal): by default the
+    intended duty is re-applied every cycle so external writers are undone
+    within one interval; with self_heal = false it is written only on change
   * GPU absent (unplugged or driver not loaded) -> fail-safe mode: fans are
     driven to on_sensor_error_pwm and the service keeps polling for the GPU,
     resuming normal control when it appears again (no crash-loop)
@@ -110,6 +113,12 @@ class Config:
         self.spin_up_margin = int(m.get("spin_up_margin", "48"))
         self.on_sensor_error_pwm = int(m.get("on_sensor_error_pwm", "255"))
         self.fan_rpm_min = int(m.get("fan_rpm_min", "0"))      # 0 = disabled
+        # self-healing: re-apply the intended pwm on EVERY cycle, even when
+        # unchanged, so external writers (pwmconfig, a stray echo 0 > pwmN,
+        # manual testing) are undone within one interval. With self_heal =
+        # false the pwm is only written when it actually changes - external
+        # writers then win until the next change.
+        self.self_heal = m.get("self_heal", "true").strip().lower() in ("1", "true", "yes")
         # --- stall control (opt-in) ------------------------------------------
         # Allow the fan to stop completely (pwm 0) when the GPU is cool, with
         # hysteresis so temperature oscillation can't make it flap:
@@ -472,7 +481,8 @@ class FanController:
                 for g in self.groups:
                     g.stalled = False      # fail-safe overrides any stall
                     g.below_streak = 0
-                    g.set_pwm(fail_pwm, self.dry_run)
+                    if fail_pwm != g.current_pwm or self.cfg.self_heal:
+                        g.set_pwm(fail_pwm, self.dry_run)
                     g.current_pwm = fail_pwm
                 return
 
@@ -492,7 +502,8 @@ class FanController:
             for g in self.groups:
                 g.stalled = False
                 g.below_streak = 0
-                g.set_pwm(fail_pwm, self.dry_run)
+                if fail_pwm != g.current_pwm or self.cfg.self_heal:
+                    g.set_pwm(fail_pwm, self.dry_run)
                 g.current_pwm = fail_pwm
             return
 
@@ -520,8 +531,10 @@ class FanController:
                 # same section order as the status line: FAN | TEMPS | CONTROL
                 log.info("[%s] pwm %d -> %d | %s | target=%d dominant=%s",
                          g.name, g.current_pwm, new, tstr, target, dom)
-            # always re-apply (even when unchanged): heals external clobbering
-            g.set_pwm(new, self.dry_run, stall=g.stalled)
+            # with self_heal: re-apply even when unchanged (heals external
+            # clobbering); without: write only on change
+            if new != g.current_pwm or self.cfg.self_heal:
+                g.set_pwm(new, self.dry_run, stall=g.stalled)
             g.current_pwm = new
 
         for g in self.groups:
@@ -698,11 +711,12 @@ class FanController:
         stall = (f"{self.cfg.stall_temp:g}C+{self.cfg.stall_start_margin:g}C"
                  if self.cfg.allow_stall else "off")
         log.info("fanctrl starting: fans=%s gpus=%s interval=%.1fs "
-                 "ramp_up=%d ramp_down=%d spin_up_margin=%d stall=%s dry_run=%s",
+                 "ramp_up=%d ramp_down=%d spin_up_margin=%d stall=%s "
+                 "self_heal=%s dry_run=%s",
                  ",".join(g.name for g in self.groups),
                  ",".join(g.name for g, _ in self.gpus) or "<none present>",
                  self.cfg.interval, self.cfg.ramp_up_step, self.cfg.ramp_down_step,
-                 self.cfg.spin_up_margin, stall, self.dry_run)
+                 self.cfg.spin_up_margin, stall, self.cfg.self_heal, self.dry_run)
         while not self._stop:
             started = time.monotonic()
             try:

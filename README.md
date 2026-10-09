@@ -30,10 +30,13 @@ from sysfs:
   `on_sensor_error_pwm` (default: full speed). The service does NOT crash:
   it logs one error, keeps polling for the GPU and resumes normal control
   automatically when it appears again (e.g. after `modprobe amdgpu`).
-* **Self-healing pwm writes**: the intended duty is re-applied to every fan
-  on *every* cycle (not write-once), so external writers that clobber sysfs
-  (`sudo pwmconfig`, a stray `echo 0 > pwmN`, ...) are undone within one
-  `interval` instead of silently winning until the next restart.
+* **Self-healing pwm writes** (`self_heal`, default on): the intended duty
+  is re-applied to every fan on *every* cycle (not write-once), so external
+  writers that clobber sysfs (`sudo pwmconfig`, a stray `echo 0 > pwmN`, ...)
+  are undone within one `interval` instead of silently winning until the
+  next change. With `self_heal = false` the pwm is only written when it
+  actually changes - manual interventions then stick until the controller
+  next wants a different value.
 * Optional rpm monitoring (`fan_rpm_min`): warns in the journal when a fan
   appears stuck/dead (3 consecutive low readings) — the warning includes the
   current GPU temps. If a `--calibrate` fit exists, the threshold becomes
@@ -162,6 +165,8 @@ sensors | grep -A3 it8728              # pwm2 % + fan2 rpm
   `stall_chase_limit` — stall control (see above).
 * `sync_warn_pct` / `sync_warn_min_diff` — desync warning for synced groups.
 * `fan_rpm_min` — dead-fan threshold (calibration-aware if a fit exists).
+* `self_heal` — re-apply the pwm every cycle (default true) or only on
+  change (false; manual pwm writes then stick).
 * `status_every` — status line every N cycles (0 disables).
 
 After editing: `sudo systemctl restart fanctrl`.
