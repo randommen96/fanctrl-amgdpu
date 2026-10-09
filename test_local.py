@@ -2,7 +2,7 @@
 """Local tests for fanctrl.py: curve math, multi-GPU, synced fan groups,
 anti-hunting hysteresis, rpm warning w/ temps, status lines, fail-safe,
 GPU-absent (driver not loaded) mode + recovery."""
-import importlib.util, json, logging, os, shutil, tempfile
+import importlib.util, json, logging, os, re, shutil, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("fanctrl", os.path.join(HERE, "fanctrl.py"))
@@ -17,6 +17,9 @@ cap = CapHandler()
 cap.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
 logging.getLogger("fanctrl").addHandler(cap)
 logging.getLogger("fanctrl").setLevel(logging.DEBUG)
+
+def msg(r):  # strip the 'LEVEL ' prefix the cap handler adds
+    return r[1][len(r[0]) + 1:]
 
 def make_gpu(base, name, edge="27000", junction="28000", mem="25000"):
     d = os.path.join(base, name)
@@ -158,9 +161,12 @@ open(os.path.join(fanC, "rpm"), "w").write("0\n")
 records.clear()
 for _ in range(5):
     ctl2.cycle()
-warns = [r for r in records if r[0] == "WARNING" and "fan rpm" in r[1]]
-assert warns and "gpu1[junction=71.0]" in warns[0][1], warns[:1]
-print("4. rpm warning includes temps OK")
+warns = [r for r in records if r[0] == "WARNING" and "fan rpm" in msg(r)]
+assert warns, records[:3]
+# unified format: EVENT | TEMPS | CONTROL
+mw = re.fullmatch(r"\[fan2\] fan rpm 0 below threshold 500 while pwm=255 - fan may be stuck or dead \| gpu0\[[^\]]*\] gpu1\[[^\]]*junction=71\.0[^\]]*\] \| target=255 dominant=gpu1/junction", msg(warns[0]))
+assert mw, msg(warns[0])
+print("4. rpm warning in unified format OK")
 
 # --- 5. fail-safe when all sensors die ---------------------------------------
 for d in (gpuB, gpuC):
@@ -214,10 +220,7 @@ assert infos, records[:5]
 print("8. GPU returned: normal control resumed")
 
 # --- 9. unified log format: FAN | TEMPS | CONTROL -------------------------
-import re
 # force a pwm change on ctl2's duct group (junction hot -> ramp up)
-def msg(r):  # strip the 'LEVEL ' prefix the cap handler adds
-    return r[1][len(r[0]) + 1:]
 
 records.clear()
 ctl2.cycle()  # may or may not change; ensure a change happens next
@@ -248,7 +251,9 @@ for _ in range(3):
     ctl2.cycle()
 sync_warns = [r for r in records if r[0] == "WARNING" and "out of sync" in msg(r)]
 assert len(sync_warns) == 1, sync_warns
-assert "fan1=2900 fan2=1500" in sync_warns[0][1], sync_warns[0][1]
+# unified format: EVENT | TEMPS | CONTROL
+msw = re.fullmatch(r"\[duct\] fans out of sync: fan1=2900 fan2=1500 \(\d+ rpm apart, threshold \d+\) \| .* \| target=255 dominant=gpu1/junction", msg(sync_warns[0]))
+assert msw, msg(sync_warns[0])
 # no repeat while still out of sync
 for _ in range(3):
     ctl2.cycle()
@@ -260,6 +265,8 @@ records.clear()
 ctl2.cycle()
 rec = [r for r in records if "back in sync" in msg(r)]
 assert rec, records[:5]
+mrc = re.fullmatch(r"\[duct\] fans back in sync: fan1=2900 fan2=2870 \| .* \| target=255 dominant=gpu1/junction", msg(rec[0]))
+assert mrc, msg(rec[0])
 print("10. out-of-sync warning + recovery OK")
 
 # --- 11. fit_linear + calibration-aware dead-fan threshold ------------------
@@ -368,6 +375,8 @@ assert gS.stall_disabled and gS.transition_count == 5, \
     (gS.stall_disabled, gS.transition_count)
 chase = [r for r in records if "giving up on stalling" in msg(r)]
 assert chase, records[:6]
+mch = re.fullmatch(r"\[fan1\] stall/run chasing: 5 transitions - giving up on stalling, fan stays at min rpm for this run \| gpu0\[edge=27\.0 junction=27\.0 mem=25\.0\] \| target=32 dominant=gpu0/edge", msg(chase[0]))
+assert mch, msg(chase[0])
 # ...and from now on it never stalls again: min rpm even when cold
 for _ in range(3):
     ctlS.cycle()

@@ -56,11 +56,13 @@ from sysfs:
   below their `min_pwm`; 0 is only the explicit stalled state.
 * A periodic **status line** (`status_every`, default every 6th cycle ≈ 30 s)
   logs fan state, temperatures and target/dominant sensor, so the journal
-  always shows what is happening even when nothing changes. Change lines use
-  the same section order (FAN | TEMPS | CONTROL), e.g.
+  always shows what is happening even when nothing changes. *Every* per-cycle
+  line (pwm changes, sync warnings, dead-fan warnings, chase warnings) uses
+  the same section order FAN/EVENT | TEMPS | CONTROL, e.g.
 
       status: duct:pwm=72 rpm=1004/1092 | gpu0[edge=28.0 junction=29.0 mem=26.0] | target=32 dominant=gpu0/edge
       [duct] pwm 72 -> 136 | gpu0[edge=55.0 junction=75.0 mem=57.0] | target=136 dominant=gpu0/junction
+      [duct] fans out of sync: fan1=1002 fan2=400 (602 rpm apart, threshold 150) | gpu0[...] | target=32 dominant=gpu0/edge
 
 ## Multiple GPUs and multiple fans
 

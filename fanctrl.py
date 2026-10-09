@@ -383,6 +383,8 @@ class FanController:
         self.consec_errors = 0
         self.status_counter = 0
         self.last_temps_str = ""
+        self.last_target = None   # set each cycle; used in event log lines
+        self.last_dom = None
         self._stop = False
 
     # ---- GPU setup / rescan --------------------------------------------------
@@ -496,6 +498,8 @@ class FanController:
 
         self.consec_errors = 0
         target, dom, dom_temp = self.target_for_fan(temps)
+        self.last_target = target
+        self.last_dom = dom
 
         # ramp limiting + anti-hunting hysteresis:
         #  - fast up (safety), slow down (no hunting)
@@ -589,12 +593,16 @@ class FanController:
         g.transition_count += 1
         if g.transition_count >= self.cfg.stall_chase_limit:
             g.stall_disabled = True
-            log.warning("[%s] stall/run keeps chasing (%d transitions) - "
-                        "giving up on stalling, fan stays at min rpm for this run",
-                        g.name, g.transition_count)
+            log.warning("[%s] stall/run chasing: %d transitions - giving up on "
+                        "stalling, fan stays at min rpm for this run | %s | %s",
+                        g.name, g.transition_count, self.last_temps_str, self._ctrl())
 
     def _rpm(self, m):
         return read_sysfs_int(m.rpm_path)
+
+    def _ctrl(self):
+        """CONTROL section shared by all per-cycle event lines."""
+        return f"target={self.last_target} dominant={self.last_dom}"
 
     def check_group_sync(self, g):
         """Warn when the rpm's of a synced group diverge too far.
@@ -624,13 +632,14 @@ class FanController:
             st["streak"] += 1
             if st["streak"] == 3 and not st["warned"]:
                 detail = " ".join(f"{n}={r}" for n, r in sorted(rpms.items()))
-                log.warning("[%s] fans out of sync: %d rpm apart (%s, threshold %d) | %s",
-                            g.name, diff, detail, thresh, self.last_temps_str)
+                log.warning("[%s] fans out of sync: %s (%d rpm apart, threshold %d) | %s | %s",
+                            g.name, detail, diff, thresh, self.last_temps_str, self._ctrl())
                 st["warned"] = True
         else:
             if st["warned"]:
                 detail = " ".join(f"{n}={r}" for n, r in sorted(rpms.items()))
-                log.info("[%s] fans back in sync (%s)", g.name, detail)
+                log.info("[%s] fans back in sync: %s | %s | %s",
+                         g.name, detail, self.last_temps_str, self._ctrl())
             st["streak"] = 0
             st["warned"] = False
 
@@ -670,13 +679,14 @@ class FanController:
                 exp_str = (f" (expected ~{expected:.0f} at pwm {g.current_pwm})"
                            if expected is not None else "")
                 log.warning("[%s] fan rpm %d below threshold %d while pwm=%d%s - "
-                            "fan may be stuck or dead | %s",
+                            "fan may be stuck or dead | %s | %s",
                             m.name, rpm, threshold, g.current_pwm, exp_str,
-                            self.last_temps_str)
+                            self.last_temps_str, self._ctrl())
                 st["warned"] = True
         else:
             if st["warned"]:
-                log.info("[%s] fan rpm recovered: %d | %s", m.name, rpm, self.last_temps_str)
+                log.info("[%s] fan rpm recovered: %d | %s | %s",
+                         m.name, rpm, self.last_temps_str, self._ctrl())
             st["streak"] = 0
             st["warned"] = False
 
