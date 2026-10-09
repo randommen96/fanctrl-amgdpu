@@ -320,7 +320,6 @@ stall_temp = 45
 stall_start_margin = 2
 stall_confirm = 1
 stall_chase_limit = 5
-stall_chase_window = 600
 
 [fan1]
 pwm_path = {tmp3}/fanS/pwm
@@ -365,7 +364,8 @@ for label, v in (("cool", "27000"), ("hot", "48000"), ("cool", "27000"),
                  ("hot", "48000"), ("cool", "27000")):
     open(os.path.join(gpuS, "temp2_input"), "w").write(v + "\n")
     ctlS.cycle()
-assert gS.stall_disabled, gS.transitions
+assert gS.stall_disabled and gS.transition_count == 5, \
+    (gS.stall_disabled, gS.transition_count)
 chase = [r for r in records if "giving up on stalling" in msg(r)]
 assert chase, records[:6]
 # ...and from now on it never stalls again: min rpm even when cold

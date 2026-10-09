@@ -116,14 +116,16 @@ class Config:
         #  - stall only while the dominant temp is below stall_temp AND the
         #    curves ask for no more than baseline (stall_confirm cycles)
         #  - after a stall, restart only above stall_temp + stall_start_margin
-        #  - if it keeps chasing (>= stall_chase_limit transitions within
-        #    stall_chase_window seconds) it gives up and stays at min rpm
+        #  - if it keeps chasing (>= stall_chase_limit stall/run transitions,
+        #    counted cumulatively per run) it gives up and stays at min rpm.
+        #    No time window: the chase period can be many minutes (the card
+        #    slowly re-heats while uncooled), so a short window would never
+        #    accumulate enough flips to trigger.
         self.allow_stall = m.get("allow_stall", "false").strip().lower() in ("1", "true", "yes")
         self.stall_temp = float(m.get("stall_temp", "45"))
         self.stall_start_margin = float(m.get("stall_start_margin", "10"))
         self.stall_confirm = int(m.get("stall_confirm", "3"))
         self.stall_chase_limit = int(m.get("stall_chase_limit", "5"))
-        self.stall_chase_window = int(m.get("stall_chase_window", "600"))
         # synced groups: warn if member rpm's diverge by more than this %
         # (and at least sync_warn_min_diff rpm), sustained for a few cycles.
         # Normal bearing spread on one net is ~5-10% at low speed.
@@ -306,7 +308,7 @@ class FanGroup:
         # stall state (only used when allow_stall is on)
         self.stalled = False
         self.below_streak = 0
-        self.transitions = []      # monotonic timestamps of stall<->run changes
+        self.transition_count = 0  # cumulative stall<->run flips this run
         self.stall_disabled = False  # set once chasing is detected
 
     def set_pwm(self, value, dry_run, stall=False):
@@ -578,16 +580,18 @@ class FanController:
         return self._ramp_step(g, target)
 
     def _note_transition(self, g):
-        """Count stall<->run flips; give up on stalling if it keeps chasing."""
-        now = time.monotonic()
-        g.transitions.append(now)
-        cutoff = now - self.cfg.stall_chase_window
-        g.transitions = [t for t in g.transitions if t >= cutoff]
-        if len(g.transitions) >= self.cfg.stall_chase_limit:
+        """Count stall<->run flips; give up on stalling if it keeps chasing.
+
+        Counted cumulatively per run (no time window): a chase cycle can take
+        many minutes (card slowly re-heating from ~43 to ~55 C while the fan
+        is off), so windowing would let slow flapping run forever.
+        """
+        g.transition_count += 1
+        if g.transition_count >= self.cfg.stall_chase_limit:
             g.stall_disabled = True
-            log.warning("[%s] stall/run keeps chasing (%d transitions within %ds) - "
+            log.warning("[%s] stall/run keeps chasing (%d transitions) - "
                         "giving up on stalling, fan stays at min rpm for this run",
-                        g.name, len(g.transitions), self.cfg.stall_chase_window)
+                        g.name, g.transition_count)
 
     def _rpm(self, m):
         return read_sysfs_int(m.rpm_path)

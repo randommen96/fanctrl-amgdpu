@@ -50,7 +50,8 @@ from sysfs:
   after `stall_confirm` cycles), and after a stall it restarts only above
   `stall_temp + stall_start_margin` — the card may warm up a bit while
   uncooled, that's fine. If it keeps chasing (≥ `stall_chase_limit`
-  stall/run flips within `stall_chase_window` seconds) it gives up on
+  stall/run flips, counted per run - no time window, since a chase cycle
+  can take many minutes while the card slowly re-heats) it gives up on
   stalling for the run and holds the fan at min rpm. Running fans never go
   below their `min_pwm`; 0 is only the explicit stalled state.
 * A periodic **status line** (`status_every`, default every 6th cycle ≈ 30 s)
@@ -156,7 +157,7 @@ sensors | grep -A3 it8728              # pwm2 % + fan2 rpm
 * `[gpuN] *_points = 45:32, 60:192, 70:255` (°C:pwm pairs, linear between
   points, clamped at both ends).
 * `allow_stall`, `stall_temp`, `stall_start_margin`, `stall_confirm`,
-  `stall_chase_limit`, `stall_chase_window` — stall control (see above).
+  `stall_chase_limit` — stall control (see above).
 * `sync_warn_pct` / `sync_warn_min_diff` — desync warning for synced groups.
 * `fan_rpm_min` — dead-fan threshold (calibration-aware if a fit exists).
 * `status_every` — status line every N cycles (0 disables).
